@@ -1472,7 +1472,7 @@ run_parallel_tasks() {
           icon="✗"
           color="$RED"
           if [[ -s "$log_file" ]]; then
-            branch_info=" ${DIM}(see log)${RESET}"
+            branch_info=" ${DIM}(error below)${RESET}"
           fi
           ;;
         *)
@@ -1482,6 +1482,17 @@ run_parallel_tasks() {
       esac
       
       printf "  ${color}%s${RESET} Agent %d: %s%s\n" "$icon" "$agent_num" "${task:0:45}" "$branch_info"
+      
+      # Show log for failed agents
+      if [[ "$status" == "failed" ]] && [[ -s "$log_file" ]]; then
+        echo "${DIM}    ┌─ Agent $agent_num log:${RESET}"
+        sed 's/^/    │ /' "$log_file" | head -20
+        local log_lines=$(wc -l < "$log_file")
+        if [[ $log_lines -gt 20 ]]; then
+          echo "${DIM}    │ ... ($((log_lines - 20)) more lines)${RESET}"
+        fi
+        echo "${DIM}    └─${RESET}"
+      fi
       
       # Cleanup temp files
       rm -f "$status_file" "$output_file" "$log_file"
