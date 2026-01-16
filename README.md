@@ -1,6 +1,6 @@
 # Ralphy
 
-An autonomous AI coding loop that runs AI assistants (Claude Code or OpenCode) to work through tasks until everything is complete.
+An autonomous AI coding loop that runs AI assistants (Claude Code, OpenCode, or Cursor) to work through tasks until everything is complete.
 
 ## What It Does
 
@@ -36,7 +36,7 @@ That's it. Ralphy will work through each task autonomously.
 ## Requirements
 
 **Required:**
-- [Claude Code CLI](https://github.com/anthropics/claude-code) or [OpenCode CLI](https://opencode.ai/docs/)
+- One of: [Claude Code CLI](https://github.com/anthropics/claude-code), [OpenCode CLI](https://opencode.ai/docs/), or [Cursor](https://cursor.com) (with `agent` in PATH)
 - `jq` (for JSON parsing)
 
 **Optional:**
@@ -151,7 +151,18 @@ Example: "Add user authentication" becomes `ralphy/add-user-authentication`
 ```bash
 ./ralphy.sh              # Claude Code (default)
 ./ralphy.sh --opencode   # OpenCode
+./ralphy.sh --cursor     # Cursor agent
 ```
+
+### Engine Details
+
+| Engine | CLI Command | Permissions Flag | Output |
+|--------|-------------|------------------|--------|
+| Claude Code | `claude` | `--dangerously-skip-permissions` | Token usage + cost estimate |
+| OpenCode | `opencode` | `OPENCODE_PERMISSION='{"*":"allow"}'` | Token usage + actual cost |
+| Cursor | `agent` | `--force` | API duration (no token counts) |
+
+**Note:** Cursor's CLI doesn't expose token usage, so Ralphy tracks total API duration instead.
 
 ## All Options
 
@@ -160,6 +171,7 @@ Example: "Add user authentication" becomes `ralphy/add-user-authentication`
 |------|-------------|
 | `--claude` | Use Claude Code (default) |
 | `--opencode` | Use OpenCode |
+| `--cursor`, `--agent` | Use Cursor agent |
 
 ### Task Source
 | Flag | Description |
@@ -214,6 +226,12 @@ Example: "Add user authentication" becomes `ralphy/add-user-authentication`
 # Fast mode with OpenCode
 ./ralphy.sh --opencode --fast
 
+# Use Cursor agent
+./ralphy.sh --cursor
+
+# Cursor with parallel execution
+./ralphy.sh --cursor --parallel --max-parallel 4
+
 # Parallel with 4 agents and auto-PRs
 ./ralphy.sh --parallel --max-parallel 4 --create-pr
 
@@ -244,12 +262,24 @@ In parallel mode:
 
 ## Cost Tracking
 
-At completion, Ralphy shows:
-- Total input/output tokens
-- Estimated cost (or actual cost for OpenCode)
-- Branches created
+At completion, Ralphy shows different metrics depending on the AI engine:
+
+| Engine | Metrics Shown |
+|--------|---------------|
+| Claude Code | Input/output tokens, estimated cost |
+| OpenCode | Input/output tokens, actual cost |
+| Cursor | Total API duration (tokens not available) |
+
+All engines show branches created (if using `--branch-per-task`).
 
 ## Changelog
+
+### v3.1.0
+- Added Cursor agent support (`--cursor` or `--agent` flag)
+- Cursor uses `--print --force` flags for non-interactive execution
+- Track API duration for Cursor (token counts not available in Cursor CLI)
+- Improved task completion verification (checks actual PRD state, not just AI output)
+- Fixed display issues with task counts
 
 ### v3.0.1
 - Parallel agents now run in isolated git worktrees

@@ -12,12 +12,12 @@ set -euo pipefail
 # CONFIGURATION & DEFAULTS
 # ============================================
 
-VERSION="3.0.1"
+VERSION="3.1.0"
 
 # Runtime options
 SKIP_TESTS=false
 SKIP_LINT=false
-USE_OPENCODE=false
+AI_ENGINE="claude"  # claude, opencode, or cursor
 DRY_RUN=false
 MAX_ITERATIONS=0  # 0 = unlimited
 MAX_RETRIES=3
@@ -63,6 +63,7 @@ current_step="Thinking"
 total_input_tokens=0
 total_output_tokens=0
 total_actual_cost="0"  # OpenCode provides actual cost
+total_duration_ms=0    # Cursor provides duration
 iteration=0
 retry_count=0
 declare -a parallel_pids=()
@@ -113,8 +114,9 @@ ${BOLD}USAGE:${RESET}
   ./ralphy.sh [options]
 
 ${BOLD}AI ENGINE OPTIONS:${RESET}
-  --opencode          Use OpenCode instead of Claude Code
   --claude            Use Claude Code (default)
+  --opencode          Use OpenCode
+  --cursor            Use Cursor agent
 
 ${BOLD}WORKFLOW OPTIONS:${RESET}
   --no-tests          Skip writing and running tests
@@ -151,6 +153,7 @@ ${BOLD}OTHER OPTIONS:${RESET}
 ${BOLD}EXAMPLES:${RESET}
   ./ralphy.sh                              # Run with Claude Code
   ./ralphy.sh --opencode                   # Run with OpenCode
+  ./ralphy.sh --cursor                     # Run with Cursor agent
   ./ralphy.sh --branch-per-task --create-pr  # Feature branch workflow
   ./ralphy.sh --parallel --max-parallel 4  # Run 4 tasks concurrently
   ./ralphy.sh --yaml tasks.yaml            # Use YAML task file
@@ -197,11 +200,15 @@ parse_args() {
         shift
         ;;
       --opencode)
-        USE_OPENCODE=true
+        AI_ENGINE="opencode"
         shift
         ;;
       --claude)
-        USE_OPENCODE=false
+        AI_ENGINE="claude"
+        shift
+        ;;
+      --cursor|--agent)
+        AI_ENGINE="cursor"
         shift
         ;;
       --dry-run)
@@ -322,17 +329,26 @@ check_requirements() {
   esac
 
   # Check for AI CLI
-  if [[ "$USE_OPENCODE" == true ]]; then
-    if ! command -v opencode &>/dev/null; then
-      log_error "OpenCode CLI not found. Install from https://opencode.ai/docs/"
-      exit 1
-    fi
-  else
-    if ! command -v claude &>/dev/null; then
-      log_error "Claude Code CLI not found. Install from https://github.com/anthropics/claude-code"
-      exit 1
-    fi
-  fi
+  case "$AI_ENGINE" in
+    opencode)
+      if ! command -v opencode &>/dev/null; then
+        log_error "OpenCode CLI not found. Install from https://opencode.ai/docs/"
+        exit 1
+      fi
+      ;;
+    cursor)
+      if ! command -v agent &>/dev/null; then
+        log_error "Cursor agent CLI not found. Make sure Cursor is installed and 'agent' is in your PATH."
+        exit 1
+      fi
+      ;;
+    *)
+      if ! command -v claude &>/dev/null; then
+        log_error "Claude Code CLI not found. Install from https://github.com/anthropics/claude-code"
+        exit 1
+      fi
+      ;;
+  esac
 
   # Check for jq
   if ! command -v jq &>/dev/null; then
@@ -839,18 +855,27 @@ run_ai_command() {
   local prompt=$1
   local output_file=$2
   
-  if [[ "$USE_OPENCODE" == true ]]; then
-    # OpenCode: use 'run' command with JSON format and permissive settings
-    OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-      --format json \
-      "$prompt" > "$output_file" 2>&1 &
-  else
-    # Claude Code: use existing approach
-    claude --dangerously-skip-permissions \
-      --verbose \
-      --output-format stream-json \
-      -p "$prompt" > "$output_file" 2>&1 &
-  fi
+  case "$AI_ENGINE" in
+    opencode)
+      # OpenCode: use 'run' command with JSON format and permissive settings
+      OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+        --format json \
+        "$prompt" > "$output_file" 2>&1 &
+      ;;
+    cursor)
+      # Cursor agent: use --print for non-interactive, --force to allow all commands
+      agent --print --force \
+        --output-format stream-json \
+        "$prompt" > "$output_file" 2>&1 &
+      ;;
+    *)
+      # Claude Code: use existing approach
+      claude --dangerously-skip-permissions \
+        --verbose \
+        --output-format stream-json \
+        -p "$prompt" > "$output_file" 2>&1 &
+      ;;
+  esac
   
   ai_pid=$!
 }
@@ -862,36 +887,72 @@ parse_ai_result() {
   local output_tokens=0
   local actual_cost="0"
   
-  if [[ "$USE_OPENCODE" == true ]]; then
-    # OpenCode JSON format: uses step_finish for tokens and text events for response
-    local step_finish
-    step_finish=$(echo "$result" | grep '"type":"step_finish"' | tail -1 || echo "")
-    
-    if [[ -n "$step_finish" ]]; then
-      input_tokens=$(echo "$step_finish" | jq -r '.part.tokens.input // 0' 2>/dev/null || echo "0")
-      output_tokens=$(echo "$step_finish" | jq -r '.part.tokens.output // 0' 2>/dev/null || echo "0")
-      # OpenCode provides actual cost directly
-      actual_cost=$(echo "$step_finish" | jq -r '.part.cost // 0' 2>/dev/null || echo "0")
-    fi
-    
-    # Get text response from text events
-    response=$(echo "$result" | grep '"type":"text"' | jq -rs 'map(.part.text // "") | join("")' 2>/dev/null || echo "")
-    
-    # If no text found, indicate task completed
-    if [[ -z "$response" ]]; then
-      response="Task completed"
-    fi
-  else
-    # Claude Code stream-json parsing
-    local result_line
-    result_line=$(echo "$result" | grep '"type":"result"' | tail -1)
-    
-    if [[ -n "$result_line" ]]; then
-      response=$(echo "$result_line" | jq -r '.result // "No result text"' 2>/dev/null || echo "Could not parse result")
-      input_tokens=$(echo "$result_line" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
-      output_tokens=$(echo "$result_line" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
-    fi
-  fi
+  case "$AI_ENGINE" in
+    opencode)
+      # OpenCode JSON format: uses step_finish for tokens and text events for response
+      local step_finish
+      step_finish=$(echo "$result" | grep '"type":"step_finish"' | tail -1 || echo "")
+      
+      if [[ -n "$step_finish" ]]; then
+        input_tokens=$(echo "$step_finish" | jq -r '.part.tokens.input // 0' 2>/dev/null || echo "0")
+        output_tokens=$(echo "$step_finish" | jq -r '.part.tokens.output // 0' 2>/dev/null || echo "0")
+        # OpenCode provides actual cost directly
+        actual_cost=$(echo "$step_finish" | jq -r '.part.cost // 0' 2>/dev/null || echo "0")
+      fi
+      
+      # Get text response from text events
+      response=$(echo "$result" | grep '"type":"text"' | jq -rs 'map(.part.text // "") | join("")' 2>/dev/null || echo "")
+      
+      # If no text found, indicate task completed
+      if [[ -z "$response" ]]; then
+        response="Task completed"
+      fi
+      ;;
+    cursor)
+      # Cursor agent: parse stream-json output
+      # Cursor doesn't provide token counts, but does provide duration_ms
+      
+      local result_line
+      result_line=$(echo "$result" | grep '"type":"result"' | tail -1)
+      
+      if [[ -n "$result_line" ]]; then
+        response=$(echo "$result_line" | jq -r '.result // "Task completed"' 2>/dev/null || echo "Task completed")
+        # Cursor provides duration instead of tokens
+        local duration_ms
+        duration_ms=$(echo "$result_line" | jq -r '.duration_ms // 0' 2>/dev/null || echo "0")
+        # Store duration in output_tokens field for now (we'll handle it specially)
+        # Use negative value as marker that this is duration, not tokens
+        if [[ "$duration_ms" =~ ^[0-9]+$ ]] && [[ "$duration_ms" -gt 0 ]]; then
+          # Encode duration: store as-is, we track separately
+          actual_cost="duration:$duration_ms"
+        fi
+      fi
+      
+      # Get response from assistant message if result is empty
+      if [[ -z "$response" ]] || [[ "$response" == "Task completed" ]]; then
+        local assistant_msg
+        assistant_msg=$(echo "$result" | grep '"type":"assistant"' | tail -1)
+        if [[ -n "$assistant_msg" ]]; then
+          response=$(echo "$assistant_msg" | jq -r '.message.content[0].text // .message.content // "Task completed"' 2>/dev/null || echo "Task completed")
+        fi
+      fi
+      
+      # Tokens remain 0 for Cursor (not available)
+      input_tokens=0
+      output_tokens=0
+      ;;
+    *)
+      # Claude Code stream-json parsing
+      local result_line
+      result_line=$(echo "$result" | grep '"type":"result"' | tail -1)
+      
+      if [[ -n "$result_line" ]]; then
+        response=$(echo "$result_line" | jq -r '.result // "No result text"' 2>/dev/null || echo "Could not parse result")
+        input_tokens=$(echo "$result_line" | jq -r '.usage.input_tokens // 0' 2>/dev/null || echo "0")
+        output_tokens=$(echo "$result_line" | jq -r '.usage.output_tokens // 0' 2>/dev/null || echo "0")
+      fi
+      ;;
+  esac
   
   # Sanitize token counts
   [[ "$input_tokens" =~ ^[0-9]+$ ]] || input_tokens=0
@@ -945,10 +1006,11 @@ run_single_task() {
   echo ""
   echo "${BOLD}>>> Task $task_num${RESET}"
   
-  local remaining
-  remaining=$(count_remaining_tasks)
-  local completed
-  completed=$(count_completed_tasks)
+  local remaining completed
+  remaining=$(count_remaining_tasks | tr -d '[:space:]')
+  completed=$(count_completed_tasks | tr -d '[:space:]')
+  remaining=${remaining:-0}
+  completed=${completed:-0}
   echo "${DIM}    Completed: $completed | Remaining: $remaining${RESET}"
   echo "--------------------------------------------"
 
@@ -1075,9 +1137,16 @@ run_single_task() {
     total_input_tokens=$((total_input_tokens + input_tokens))
     total_output_tokens=$((total_output_tokens + output_tokens))
     
-    # Track actual cost for OpenCode
-    if [[ -n "$actual_cost" ]] && [[ "$actual_cost" != "0" ]] && command -v bc &>/dev/null; then
-      total_actual_cost=$(echo "scale=6; $total_actual_cost + $actual_cost" | bc 2>/dev/null || echo "$total_actual_cost")
+    # Track actual cost for OpenCode, or duration for Cursor
+    if [[ -n "$actual_cost" ]]; then
+      if [[ "$actual_cost" == duration:* ]]; then
+        # Cursor duration tracking
+        local dur_ms="${actual_cost#duration:}"
+        [[ "$dur_ms" =~ ^[0-9]+$ ]] && total_duration_ms=$((total_duration_ms + dur_ms))
+      elif [[ "$actual_cost" != "0" ]] && command -v bc &>/dev/null; then
+        # OpenCode cost tracking
+        total_actual_cost=$(echo "scale=6; $total_actual_cost + $actual_cost" | bc 2>/dev/null || echo "$total_actual_cost")
+      fi
     fi
 
     rm -f "$tmpfile"
@@ -1096,9 +1165,19 @@ run_single_task() {
     # Return to base branch
     return_to_base_branch
 
-    # Check for completion
+    # Check for completion - verify by actually counting remaining tasks
+    local remaining_count
+    remaining_count=$(count_remaining_tasks | tr -d '[:space:]' | head -1)
+    remaining_count=${remaining_count:-0}
+    [[ "$remaining_count" =~ ^[0-9]+$ ]] || remaining_count=0
+    
+    if [[ "$remaining_count" -eq 0 ]]; then
+      return 2  # All tasks actually complete
+    fi
+    
+    # AI might claim completion but tasks remain - continue anyway
     if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
-      return 2  # Special code for "all done"
+      log_debug "AI claimed completion but $remaining_count tasks remain, continuing..."
     fi
 
     return 0
@@ -1223,22 +1302,33 @@ Focus only on implementing: $task_name"
   local retry=0
   
   while [[ $retry -lt $MAX_RETRIES ]]; do
-    if [[ "$USE_OPENCODE" == true ]]; then
-      (
-        cd "$worktree_dir"
-        OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-          --format json \
-          "$prompt"
-      ) > "$tmpfile" 2>>"$log_file"
-    else
-      (
-        cd "$worktree_dir"
-        claude --dangerously-skip-permissions \
-          --verbose \
-          -p "$prompt" \
-          --output-format stream-json
-      ) > "$tmpfile" 2>>"$log_file"
-    fi
+    case "$AI_ENGINE" in
+      opencode)
+        (
+          cd "$worktree_dir"
+          OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+            --format json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      cursor)
+        (
+          cd "$worktree_dir"
+          agent --print --force \
+            --output-format stream-json \
+            "$prompt"
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+      *)
+        (
+          cd "$worktree_dir"
+          claude --dangerously-skip-permissions \
+            --verbose \
+            -p "$prompt" \
+            --output-format stream-json
+        ) > "$tmpfile" 2>>"$log_file"
+        ;;
+    esac
     
     result=$(cat "$tmpfile" 2>/dev/null || echo "")
     
@@ -1330,7 +1420,7 @@ run_parallel_tasks() {
   log_info "Base branch: $BASE_BRANCH"
   
   # Export variables needed by subshell agents
-  export USE_OPENCODE MAX_RETRIES RETRY_DELAY PRD_SOURCE PRD_FILE CREATE_PR PR_DRAFT
+  export AI_ENGINE MAX_RETRIES RETRY_DELAY PRD_SOURCE PRD_FILE CREATE_PR PR_DRAFT
   
   # Process tasks in batches
   local batch_start=0
@@ -1614,15 +1704,23 @@ Be careful to preserve functionality from BOTH branches. The goal is to integrat
           local resolve_tmpfile
           resolve_tmpfile=$(mktemp)
           
-          if [[ "$USE_OPENCODE" == true ]]; then
-            OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
-              --format json \
-              "$resolve_prompt" > "$resolve_tmpfile" 2>&1
-          else
-            claude --dangerously-skip-permissions \
-              -p "$resolve_prompt" \
-              --output-format stream-json > "$resolve_tmpfile" 2>&1
-          fi
+          case "$AI_ENGINE" in
+            opencode)
+              OPENCODE_PERMISSION='{"*":"allow"}' opencode run \
+                --format json \
+                "$resolve_prompt" > "$resolve_tmpfile" 2>&1
+              ;;
+            cursor)
+              agent --print --force \
+                --output-format stream-json \
+                "$resolve_prompt" > "$resolve_tmpfile" 2>&1
+              ;;
+            *)
+              claude --dangerously-skip-permissions \
+                -p "$resolve_prompt" \
+                --output-format stream-json > "$resolve_tmpfile" 2>&1
+              ;;
+          esac
           
           rm -f "$resolve_tmpfile"
           
@@ -1672,25 +1770,41 @@ show_summary() {
   echo "${BOLD}============================================${RESET}"
   echo ""
   echo "${BOLD}>>> Cost Summary${RESET}"
-  echo "Input tokens:  $total_input_tokens"
-  echo "Output tokens: $total_output_tokens"
-  echo "Total tokens:  $((total_input_tokens + total_output_tokens))"
   
-  # Show actual cost if available (OpenCode provides this), otherwise estimate
-  if [[ "$USE_OPENCODE" == true ]] && command -v bc &>/dev/null; then
-    local has_actual_cost
-    has_actual_cost=$(echo "$total_actual_cost > 0" | bc 2>/dev/null || echo "0")
-    if [[ "$has_actual_cost" == "1" ]]; then
-      echo "Actual cost:   \$${total_actual_cost}"
+  # Cursor doesn't provide token usage, but does provide duration
+  if [[ "$AI_ENGINE" == "cursor" ]]; then
+    echo "${DIM}Token usage not available (Cursor CLI doesn't expose this data)${RESET}"
+    if [[ "$total_duration_ms" -gt 0 ]]; then
+      local dur_sec=$((total_duration_ms / 1000))
+      local dur_min=$((dur_sec / 60))
+      local dur_sec_rem=$((dur_sec % 60))
+      if [[ "$dur_min" -gt 0 ]]; then
+        echo "Total API time: ${dur_min}m ${dur_sec_rem}s"
+      else
+        echo "Total API time: ${dur_sec}s"
+      fi
+    fi
+  else
+    echo "Input tokens:  $total_input_tokens"
+    echo "Output tokens: $total_output_tokens"
+    echo "Total tokens:  $((total_input_tokens + total_output_tokens))"
+    
+    # Show actual cost if available (OpenCode provides this), otherwise estimate
+    if [[ "$AI_ENGINE" == "opencode" ]] && command -v bc &>/dev/null; then
+      local has_actual_cost
+      has_actual_cost=$(echo "$total_actual_cost > 0" | bc 2>/dev/null || echo "0")
+      if [[ "$has_actual_cost" == "1" ]]; then
+        echo "Actual cost:   \$${total_actual_cost}"
+      else
+        local cost
+        cost=$(calculate_cost "$total_input_tokens" "$total_output_tokens")
+        echo "Est. cost:     \$$cost"
+      fi
     else
       local cost
       cost=$(calculate_cost "$total_input_tokens" "$total_output_tokens")
       echo "Est. cost:     \$$cost"
     fi
-  else
-    local cost
-    cost=$(calculate_cost "$total_input_tokens" "$total_output_tokens")
-    echo "Est. cost:     \$$cost"
   fi
   
   # Show branches if created
@@ -1722,7 +1836,13 @@ main() {
   # Show banner
   echo "${BOLD}============================================${RESET}"
   echo "${BOLD}Ralphy${RESET} - Running until PRD is complete"
-  echo "Engine: $([ "$USE_OPENCODE" = true ] && echo "${CYAN}OpenCode${RESET}" || echo "${MAGENTA}Claude Code${RESET}")"
+  local engine_display
+  case "$AI_ENGINE" in
+    opencode) engine_display="${CYAN}OpenCode${RESET}" ;;
+    cursor) engine_display="${YELLOW}Cursor Agent${RESET}" ;;
+    *) engine_display="${MAGENTA}Claude Code${RESET}" ;;
+  esac
+  echo "Engine: $engine_display"
   echo "Source: ${CYAN}$PRD_SOURCE${RESET} (${PRD_FILE:-$GITHUB_REPO})"
   
   local mode_parts=()
