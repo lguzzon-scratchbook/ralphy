@@ -123,7 +123,7 @@ slugify() {
 init_ralphy_config() {
   if [[ -d "$RALPHY_DIR" ]]; then
     log_warn "$RALPHY_DIR already exists"
-    read -p "Overwrite config? [y/N] " -n 1 -r
+    read -p "Overwrite config? [y/N] " -n 1 -r -t 30 2>/dev/null || true
     echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
   fi
@@ -163,7 +163,7 @@ init_ralphy_config() {
     echo "$deps" | grep -qx "nuxt" && frameworks+=("Nuxt")
     echo "$deps" | grep -qx "@remix-run/react" && frameworks+=("Remix")
     echo "$deps" | grep -qx "svelte" && frameworks+=("Svelte")
-    echo "$deps" | grep -qE "^@nestjs/" && frameworks+=("NestJS")
+    echo "$deps" | grep -qE "@nestjs/" && frameworks+=("NestJS")
     echo "$deps" | grep -qx "hono" && frameworks+=("Hono")
     echo "$deps" | grep -qx "fastify" && frameworks+=("Fastify")
     echo "$deps" | grep -qx "express" && frameworks+=("Express")
@@ -381,8 +381,8 @@ add_ralphy_rule() {
     exit 1
   fi
 
-  # Add rule to the rules array
-  yq -i ".rules += [\"$rule\"]" "$CONFIG_FILE"
+  # Add rule to the rules array (use env var to avoid YAML injection)
+  RULE="$rule" yq -i '.rules += [env(RULE)]' "$CONFIG_FILE"
   log_success "Added rule: $rule"
 }
 
@@ -776,7 +776,8 @@ parse_args() {
         shift
         ;;
       --add-rule)
-        ADD_RULE="${2:-}"
+        [[ -z "${2:-}" ]] && { log_error "--add-rule requires an argument"; exit 1; }
+        ADD_RULE="$2"
         shift 2
         ;;
       --no-commit)
