@@ -14,10 +14,14 @@ set -euo pipefail
 
 VERSION="4.0.0"
 
-# Brownfield mode (single-task without PRD)
+# Ralphy config directory
 RALPHY_DIR=".ralphy"
+PROGRESS_FILE="$RALPHY_DIR/progress.txt"
+CONFIG_FILE="$RALPHY_DIR/config.yaml"
 SINGLE_TASK=""
 INIT_MODE=false
+SHOW_CONFIG=false
+ADD_RULE=""
 AUTO_COMMIT=true
 
 # Runtime options
@@ -119,187 +123,305 @@ slugify() {
 init_ralphy_config() {
   if [[ -d "$RALPHY_DIR" ]]; then
     log_warn "$RALPHY_DIR already exists"
-    read -p "Overwrite? [y/N] " -n 1 -r
+    read -p "Overwrite config? [y/N] " -n 1 -r
     echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
   fi
 
   mkdir -p "$RALPHY_DIR"
 
-  # Detect basic project info for context.md
-  local lang="Unknown"
-  local framework="Unknown"
+  # Smart detection
+  local project_name=""
+  local lang=""
+  local framework=""
   local test_cmd=""
+  local lint_cmd=""
+  local build_cmd=""
+
+  # Get project name from directory or package.json
+  project_name=$(basename "$PWD")
 
   if [[ -f "package.json" ]]; then
-    lang="JavaScript/TypeScript"
+    # Get name from package.json if available
+    local pkg_name
+    pkg_name=$(jq -r '.name // ""' package.json 2>/dev/null)
+    [[ -n "$pkg_name" ]] && project_name="$pkg_name"
+
+    # Detect language
+    if [[ -f "tsconfig.json" ]]; then
+      lang="TypeScript"
+    else
+      lang="JavaScript"
+    fi
+
     # Detect framework from dependencies
     local deps
     deps=$(jq -r '(.dependencies // {}) + (.devDependencies // {}) | keys[]' package.json 2>/dev/null || true)
     [[ "$deps" == *"next"* ]] && framework="Next.js"
-    [[ "$deps" == *"react"* ]] && [[ "$framework" == "Unknown" ]] && framework="React"
+    [[ "$deps" == *"nuxt"* ]] && framework="Nuxt"
+    [[ "$deps" == *"remix"* ]] && framework="Remix"
+    [[ "$deps" == *"react"* ]] && [[ -z "$framework" ]] && framework="React"
+    [[ "$deps" == *"vue"* ]] && [[ -z "$framework" ]] && framework="Vue"
+    [[ "$deps" == *"svelte"* ]] && framework="Svelte"
     [[ "$deps" == *"express"* ]] && framework="Express"
     [[ "$deps" == *"fastify"* ]] && framework="Fastify"
-    [[ "$deps" == *"nest"* ]] && framework="NestJS"
-    # Detect test command
-    [[ "$deps" == *"jest"* ]] && test_cmd="npm test"
+    [[ "$deps" == *"@nestjs"* ]] && framework="NestJS"
+    [[ "$deps" == *"hono"* ]] && framework="Hono"
+
+    # Detect commands from package.json scripts
+    local scripts
+    scripts=$(jq -r '.scripts // {}' package.json 2>/dev/null)
+
+    # Test command
+    if echo "$scripts" | jq -e '.test' >/dev/null 2>&1; then
+      test_cmd="npm test"
+    fi
     [[ "$deps" == *"vitest"* ]] && test_cmd="npm test"
-    [[ "$deps" == *"bun"* ]] && test_cmd="bun test"
-  elif [[ -f "pyproject.toml" ]] || [[ -f "requirements.txt" ]]; then
+    [[ "$deps" == *"jest"* ]] && test_cmd="npm test"
+    [[ -f "bun.lockb" ]] && test_cmd="bun test"
+
+    # Lint command
+    if echo "$scripts" | jq -e '.lint' >/dev/null 2>&1; then
+      lint_cmd="npm run lint"
+    fi
+
+    # Build command
+    if echo "$scripts" | jq -e '.build' >/dev/null 2>&1; then
+      build_cmd="npm run build"
+    fi
+
+  elif [[ -f "pyproject.toml" ]] || [[ -f "requirements.txt" ]] || [[ -f "setup.py" ]]; then
     lang="Python"
-    [[ -f "pyproject.toml" ]] && grep -q "fastapi" pyproject.toml 2>/dev/null && framework="FastAPI"
-    [[ -f "pyproject.toml" ]] && grep -q "django" pyproject.toml 2>/dev/null && framework="Django"
+    [[ -f "pyproject.toml" ]] && grep -qi "fastapi" pyproject.toml 2>/dev/null && framework="FastAPI"
+    [[ -f "pyproject.toml" ]] && grep -qi "django" pyproject.toml 2>/dev/null && framework="Django"
+    [[ -f "pyproject.toml" ]] && grep -qi "flask" pyproject.toml 2>/dev/null && framework="Flask"
     test_cmd="pytest"
+    lint_cmd="ruff check ."
+
   elif [[ -f "go.mod" ]]; then
     lang="Go"
     test_cmd="go test ./..."
+    lint_cmd="golangci-lint run"
+
   elif [[ -f "Cargo.toml" ]]; then
     lang="Rust"
     test_cmd="cargo test"
+    lint_cmd="cargo clippy"
+    build_cmd="cargo build"
   fi
 
-  # Create context.md
-  cat > "$RALPHY_DIR/context.md" << EOF
-# Project Context
+  # Show what we detected
+  echo ""
+  echo "${BOLD}Detected:${RESET}"
+  echo "  Project:   ${CYAN}$project_name${RESET}"
+  [[ -n "$lang" ]] && echo "  Language:  ${CYAN}$lang${RESET}"
+  [[ -n "$framework" ]] && echo "  Framework: ${CYAN}$framework${RESET}"
+  [[ -n "$test_cmd" ]] && echo "  Test:      ${CYAN}$test_cmd${RESET}"
+  [[ -n "$lint_cmd" ]] && echo "  Lint:      ${CYAN}$lint_cmd${RESET}"
+  [[ -n "$build_cmd" ]] && echo "  Build:     ${CYAN}$build_cmd${RESET}"
+  echo ""
 
-Brief summary for AI agents. Edit this to add project-specific context.
-
-## Overview
-- **Language:** $lang
-- **Framework:** $framework
-- **Description:** [Add a 1-2 sentence project description]
-
-## Key Directories
-- \`src/\` - Main source code
-- \`tests/\` - Test files
-
-## Notes
-[Add any important context the AI should know]
-EOF
-
-  # Create config.yaml
-  cat > "$RALPHY_DIR/config.yaml" << EOF
+  # Create config.yaml with detected values
+  cat > "$CONFIG_FILE" << EOF
 # Ralphy Configuration
-# User preferences and rules that persist across sessions
+# https://github.com/michaelshimeles/ralphy
 
-# Commands
+# Project info (auto-detected, edit if needed)
+project:
+  name: "$project_name"
+  language: "${lang:-Unknown}"
+  framework: "${framework:-}"
+  description: ""  # Add a brief description
+
+# Commands (auto-detected from package.json/pyproject.toml)
 commands:
-  test: "${test_cmd:-npm test}"
-  lint: ""
-  build: ""
+  test: "${test_cmd:-}"
+  lint: "${lint_cmd:-}"
+  build: "${build_cmd:-}"
 
-# Rules - instructions the AI must follow
+# Rules - instructions the AI MUST follow
 # These are injected into every prompt
-rules:
+rules: []
+  # Examples:
   # - "Always use TypeScript strict mode"
   # - "Follow the error handling pattern in src/utils/errors.ts"
-  # - "All API endpoints must have input validation"
+  # - "All API endpoints must have input validation with Zod"
+  # - "Use server actions instead of API routes in Next.js"
 
-# Boundaries - files/folders with special handling
+# Boundaries - files/folders the AI should not modify
 boundaries:
-  # never_touch:
-  #   - "src/legacy/**"
-  #   - "migrations/**"
-  # always_test:
-  #   - "src/api/**"
-  #   - "src/services/**"
-
-# Preferences
-preferences:
-  auto_commit: true
-  branch_per_task: false
+  never_touch: []
+    # Examples:
+    # - "src/legacy/**"
+    # - "migrations/**"
+    # - "*.lock"
 EOF
 
-  # Create history.md
-  cat > "$RALPHY_DIR/history.md" << EOF
-# Task History
+  # Create progress.txt
+  echo "# Ralphy Progress Log" > "$PROGRESS_FILE"
+  echo "" >> "$PROGRESS_FILE"
 
-Log of completed tasks for reference.
-
----
-EOF
-
-  # Create .ralphyignore if it doesn't exist
-  if [[ ! -f ".ralphyignore" ]]; then
-    cat > ".ralphyignore" << EOF
-# Files and directories to exclude from Ralphy's context
-node_modules/
-dist/
-build/
-.git/
-*.log
-*.lock
-EOF
-  fi
-
-  log_success "Initialized $RALPHY_DIR/"
+  log_success "Created $RALPHY_DIR/"
   echo ""
-  echo "Created:"
-  echo "  ${CYAN}$RALPHY_DIR/config.yaml${RESET}  - Your rules and preferences"
-  echo "  ${CYAN}$RALPHY_DIR/context.md${RESET}   - Project context for AI"
-  echo "  ${CYAN}$RALPHY_DIR/history.md${RESET}   - Task history log"
-  echo "  ${CYAN}.ralphyignore${RESET}            - Files to exclude"
+  echo "  ${CYAN}$CONFIG_FILE${RESET}   - Your rules and preferences"
+  echo "  ${CYAN}$PROGRESS_FILE${RESET} - Progress log (auto-updated)"
   echo ""
-  echo "Next steps:"
-  echo "  1. Edit ${CYAN}$RALPHY_DIR/config.yaml${RESET} to add your rules"
-  echo "  2. Edit ${CYAN}$RALPHY_DIR/context.md${RESET} to describe your project"
-  echo "  3. Run ${CYAN}ralphy \"your task here\"${RESET}"
+  echo "${BOLD}Next steps:${RESET}"
+  echo "  1. Add rules:  ${CYAN}ralphy --add-rule \"your rule here\"${RESET}"
+  echo "  2. Or edit:    ${CYAN}$CONFIG_FILE${RESET}"
+  echo "  3. Run:        ${CYAN}ralphy \"your task\"${RESET} or ${CYAN}ralphy${RESET} (with PRD.md)"
 }
 
 # Load rules from config.yaml
 load_ralphy_rules() {
-  local config_file="$RALPHY_DIR/config.yaml"
-  [[ ! -f "$config_file" ]] && return
+  [[ ! -f "$CONFIG_FILE" ]] && return
 
-  # Extract rules as a newline-separated list
   if command -v yq &>/dev/null; then
-    yq -r '.rules // [] | .[]' "$config_file" 2>/dev/null || true
+    yq -r '.rules // [] | .[]' "$CONFIG_FILE" 2>/dev/null || true
   fi
 }
 
 # Load boundaries from config.yaml
 load_ralphy_boundaries() {
-  local config_file="$RALPHY_DIR/config.yaml"
   local boundary_type="$1"  # never_touch or always_test
-  [[ ! -f "$config_file" ]] && return
+  [[ ! -f "$CONFIG_FILE" ]] && return
 
   if command -v yq &>/dev/null; then
-    yq -r ".boundaries.$boundary_type // [] | .[]" "$config_file" 2>/dev/null || true
+    yq -r ".boundaries.$boundary_type // [] | .[]" "$CONFIG_FILE" 2>/dev/null || true
   fi
+}
+
+# Show current config
+show_ralphy_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_warn "No config found. Run 'ralphy --init' first."
+    exit 1
+  fi
+
+  echo ""
+  echo "${BOLD}Ralphy Configuration${RESET} ($CONFIG_FILE)"
+  echo ""
+
+  if command -v yq &>/dev/null; then
+    # Project info
+    local name lang framework desc
+    name=$(yq -r '.project.name // "Unknown"' "$CONFIG_FILE" 2>/dev/null)
+    lang=$(yq -r '.project.language // "Unknown"' "$CONFIG_FILE" 2>/dev/null)
+    framework=$(yq -r '.project.framework // ""' "$CONFIG_FILE" 2>/dev/null)
+    desc=$(yq -r '.project.description // ""' "$CONFIG_FILE" 2>/dev/null)
+
+    echo "${BOLD}Project:${RESET}"
+    echo "  Name:      $name"
+    echo "  Language:  $lang"
+    [[ -n "$framework" ]] && echo "  Framework: $framework"
+    [[ -n "$desc" ]] && echo "  About:     $desc"
+    echo ""
+
+    # Commands
+    local test_cmd lint_cmd build_cmd
+    test_cmd=$(yq -r '.commands.test // ""' "$CONFIG_FILE" 2>/dev/null)
+    lint_cmd=$(yq -r '.commands.lint // ""' "$CONFIG_FILE" 2>/dev/null)
+    build_cmd=$(yq -r '.commands.build // ""' "$CONFIG_FILE" 2>/dev/null)
+
+    echo "${BOLD}Commands:${RESET}"
+    [[ -n "$test_cmd" ]] && echo "  Test:  $test_cmd" || echo "  Test:  ${DIM}(not set)${RESET}"
+    [[ -n "$lint_cmd" ]] && echo "  Lint:  $lint_cmd" || echo "  Lint:  ${DIM}(not set)${RESET}"
+    [[ -n "$build_cmd" ]] && echo "  Build: $build_cmd" || echo "  Build: ${DIM}(not set)${RESET}"
+    echo ""
+
+    # Rules
+    echo "${BOLD}Rules:${RESET}"
+    local rules
+    rules=$(yq -r '.rules // [] | .[]' "$CONFIG_FILE" 2>/dev/null)
+    if [[ -n "$rules" ]]; then
+      echo "$rules" | while read -r rule; do
+        echo "  • $rule"
+      done
+    else
+      echo "  ${DIM}(none - add with: ralphy --add-rule \"...\")${RESET}"
+    fi
+    echo ""
+
+    # Boundaries
+    local never_touch
+    never_touch=$(yq -r '.boundaries.never_touch // [] | .[]' "$CONFIG_FILE" 2>/dev/null)
+    if [[ -n "$never_touch" ]]; then
+      echo "${BOLD}Never Touch:${RESET}"
+      echo "$never_touch" | while read -r path; do
+        echo "  • $path"
+      done
+      echo ""
+    fi
+  else
+    # Fallback: just show the file
+    cat "$CONFIG_FILE"
+  fi
+}
+
+# Add a rule to config.yaml
+add_ralphy_rule() {
+  local rule="$1"
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    log_error "No config found. Run 'ralphy --init' first."
+    exit 1
+  fi
+
+  if ! command -v yq &>/dev/null; then
+    log_error "yq is required to add rules. Install from https://github.com/mikefarah/yq"
+    log_info "Or manually edit $CONFIG_FILE"
+    exit 1
+  fi
+
+  # Add rule to the rules array
+  yq -i ".rules += [\"$rule\"]" "$CONFIG_FILE"
+  log_success "Added rule: $rule"
 }
 
 # Load test command from config
 load_test_command() {
-  local config_file="$RALPHY_DIR/config.yaml"
-  [[ ! -f "$config_file" ]] && echo "" && return
+  [[ ! -f "$CONFIG_FILE" ]] && echo "" && return
 
   if command -v yq &>/dev/null; then
-    yq -r '.commands.test // ""' "$config_file" 2>/dev/null || echo ""
+    yq -r '.commands.test // ""' "$CONFIG_FILE" 2>/dev/null || echo ""
   else
     echo ""
   fi
 }
 
-# Load project context
+# Load project context from config.yaml
 load_project_context() {
-  local context_file="$RALPHY_DIR/context.md"
-  [[ -f "$context_file" ]] && cat "$context_file"
+  [[ ! -f "$CONFIG_FILE" ]] && return
+
+  if command -v yq &>/dev/null; then
+    local name lang framework desc
+    name=$(yq -r '.project.name // ""' "$CONFIG_FILE" 2>/dev/null)
+    lang=$(yq -r '.project.language // ""' "$CONFIG_FILE" 2>/dev/null)
+    framework=$(yq -r '.project.framework // ""' "$CONFIG_FILE" 2>/dev/null)
+    desc=$(yq -r '.project.description // ""' "$CONFIG_FILE" 2>/dev/null)
+
+    local context=""
+    [[ -n "$name" ]] && context+="Project: $name\n"
+    [[ -n "$lang" ]] && context+="Language: $lang\n"
+    [[ -n "$framework" ]] && context+="Framework: $framework\n"
+    [[ -n "$desc" ]] && context+="Description: $desc\n"
+    echo -e "$context"
+  fi
 }
 
-# Log task to history
+# Log task to progress file
 log_task_history() {
   local task="$1"
   local status="$2"  # completed, failed
-  local history_file="$RALPHY_DIR/history.md"
 
-  [[ ! -f "$history_file" ]] && return
+  [[ ! -f "$PROGRESS_FILE" ]] && return
 
   local timestamp
   timestamp=$(date '+%Y-%m-%d %H:%M')
   local icon="✓"
   [[ "$status" == "failed" ]] && icon="✗"
 
-  echo "- [$icon] $timestamp - $task" >> "$history_file"
+  echo "- [$icon] $timestamp - $task" >> "$PROGRESS_FILE"
 }
 
 # Build prompt with brownfield context
@@ -432,8 +554,12 @@ ${BOLD}USAGE:${RESET}
   ./ralphy.sh "task description"     # Single task mode (brownfield)
   ./ralphy.sh --init                 # Initialize .ralphy/ config
 
-${BOLD}BROWNFIELD MODE:${RESET}
-  --init              Initialize .ralphy/ directory with config files
+${BOLD}CONFIG & SETUP:${RESET}
+  --init              Initialize .ralphy/ with smart defaults
+  --config            Show current configuration
+  --add-rule "..."    Add a rule to config (e.g., "Always use Zod")
+
+${BOLD}SINGLE TASK MODE:${RESET}
   "task description"  Run a single task without PRD (quotes required)
   --no-commit         Don't auto-commit after task completion
 
@@ -630,6 +756,14 @@ parse_args() {
         INIT_MODE=true
         shift
         ;;
+      --config)
+        SHOW_CONFIG=true
+        shift
+        ;;
+      --add-rule)
+        ADD_RULE="${2:-}"
+        shift 2
+        ;;
       --no-commit)
         AUTO_COMMIT=false
         shift
@@ -768,10 +902,12 @@ check_requirements() {
     exit 1
   fi
 
-  # Create progress.txt if missing
-  if [[ ! -f "progress.txt" ]]; then
-    log_warn "progress.txt not found, creating it..."
-    touch progress.txt
+  # Ensure .ralphy/ directory exists and create progress.txt if missing
+  mkdir -p "$RALPHY_DIR"
+  if [[ ! -f "$PROGRESS_FILE" ]]; then
+    log_info "Creating $PROGRESS_FILE..."
+    echo "# Ralphy Progress Log" > "$PROGRESS_FILE"
+    echo "" >> "$PROGRESS_FILE"
   fi
 
   # Set base branch if not specified
@@ -1235,10 +1371,10 @@ $never_touch
   # Add context based on PRD source
   case "$PRD_SOURCE" in
     markdown)
-      prompt="@${PRD_FILE} @progress.txt"
+      prompt="@${PRD_FILE} @$PROGRESS_FILE"
       ;;
     yaml)
-      prompt="@${PRD_FILE} @progress.txt"
+      prompt="@${PRD_FILE} @$PROGRESS_FILE"
       ;;
     github)
       # For GitHub issues, we include the issue body
@@ -1251,7 +1387,7 @@ $never_touch
 Issue Description:
 $issue_body
 
-@progress.txt"
+@$PROGRESS_FILE"
       ;;
   esac
   
@@ -1285,14 +1421,14 @@ $step. Update ${PRD_FILE} to mark the task as completed (set completed: true)."
       ;;
     github)
       prompt="$prompt
-$step. The task will be marked complete automatically. Just note the completion in progress.txt."
+$step. The task will be marked complete automatically. Just note the completion in $PROGRESS_FILE."
       ;;
   esac
-  
+
   step=$((step+1))
-  
+
   prompt="$prompt
-$step. Append your progress to progress.txt.
+$step. Append your progress to $PROGRESS_FILE.
 $((step+1)). Commit your changes with a descriptive message.
 ONLY WORK ON A SINGLE TASK."
 
@@ -1822,9 +1958,10 @@ run_parallel_agent() {
     cp "$ORIGINAL_DIR/$PRD_FILE" "$worktree_dir/" 2>/dev/null || true
   fi
   
-  # Ensure progress.txt exists in worktree
-  touch "$worktree_dir/progress.txt"
-  
+  # Ensure .ralphy/ and progress.txt exist in worktree
+  mkdir -p "$worktree_dir/$RALPHY_DIR"
+  touch "$worktree_dir/$PROGRESS_FILE"
+
   # Build prompt for this specific task
   local prompt="You are working on a specific task. Focus ONLY on this task:
 
@@ -1833,7 +1970,7 @@ TASK: $task_name
 Instructions:
 1. Implement this specific task completely
 2. Write tests if appropriate
-3. Update progress.txt with what you did
+3. Update $PROGRESS_FILE with what you did
 4. Commit your changes with a descriptive message
 
 Do NOT modify PRD.md or mark tasks complete - that will be handled separately.
@@ -2588,6 +2725,18 @@ main() {
   # Handle --init mode
   if [[ "$INIT_MODE" == true ]]; then
     init_ralphy_config
+    exit 0
+  fi
+
+  # Handle --config mode
+  if [[ "$SHOW_CONFIG" == true ]]; then
+    show_ralphy_config
+    exit 0
+  fi
+
+  # Handle --add-rule
+  if [[ -n "$ADD_RULE" ]]; then
+    add_ralphy_rule "$ADD_RULE"
     exit 0
   fi
 
