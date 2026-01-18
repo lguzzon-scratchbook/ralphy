@@ -475,8 +475,15 @@ $task
 ## Instructions
 1. Implement the task described above
 2. Write tests if appropriate
-3. Ensure the code works correctly
-4. Commit your changes with a descriptive message
+3. Ensure the code works correctly"
+
+  # Add commit instruction only if auto-commit is enabled
+  if [[ "$AUTO_COMMIT" == "true" ]]; then
+    prompt+="
+4. Commit your changes with a descriptive message"
+  fi
+
+  prompt+="
 
 Keep changes focused and minimal. Do not refactor unrelated code."
 
