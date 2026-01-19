@@ -2745,6 +2745,11 @@ show_summary() {
 main() {
   parse_args "$@"
 
+  # Load browser setting from config (if not overridden by CLI flag)
+  if [[ "$BROWSER_ENABLED" == "auto" ]] && [[ -f "$CONFIG_FILE" ]]; then
+    BROWSER_ENABLED=$(load_browser_setting)
+  fi
+
   # Handle --init mode
   if [[ "$INIT_MODE" == true ]]; then
     init_ralphy_config
