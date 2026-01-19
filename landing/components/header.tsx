@@ -5,7 +5,7 @@ export function Header() {
     <header className="py-4 px-4">
       <div className="mx-auto max-w-xl flex items-center justify-between">
         <Link href="/" className="flex items-center gap-2 text-neutral-800">
-          <img
+          <Image
             src="/logo.png"
             alt="Ralphy"
             width={32}
