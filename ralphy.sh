@@ -896,6 +896,21 @@ check_requirements() {
       ;;
   esac
 
+  # Check for root user - Claude Code and some other AI engines don't support auto mode as root
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    case "$AI_ENGINE" in
+      claude|cursor)
+        log_error "Running as root is not supported with $AI_ENGINE."
+        log_info "Claude Code's --dangerously-skip-permissions flag cannot be used as root for security reasons."
+        log_info "Please run Ralphy as a non-root user, or use a different AI engine (--opencode, --codex, --qwen, --droid)."
+        exit 1
+        ;;
+      *)
+        log_warn "Running as root user. Some AI engines may have limited functionality."
+        ;;
+    esac
+  fi
+
   # Check for jq (required for JSON parsing)
   if ! command -v jq &>/dev/null; then
     log_error "jq is required but not installed. On Linux, install with: apt-get install jq (Debian/Ubuntu) or yum install jq (RHEL/CentOS)"
