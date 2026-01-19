@@ -37,7 +37,8 @@ async function runAgentInWorktree(
 	prdSource: string,
 	prdFile: string,
 	maxRetries: number,
-	retryDelay: number
+	retryDelay: number,
+	browserEnabled: "auto" | "true" | "false"
 ): Promise<ParallelAgentResult> {
 	let worktreeDir = "";
 	let branchName = "";
@@ -72,7 +73,7 @@ async function runAgentInWorktree(
 		}
 
 		// Build prompt
-		const prompt = buildParallelPrompt(task.title, PROGRESS_FILE);
+		const prompt = buildParallelPrompt(task.title, PROGRESS_FILE, browserEnabled);
 
 		// Execute with retry
 		const result = await withRetry(
@@ -111,6 +112,7 @@ export async function runParallel(
 		maxParallel,
 		prdSource,
 		prdFile,
+		browserEnabled,
 	} = options;
 
 	const result: ExecutionResult = {
@@ -181,7 +183,8 @@ export async function runParallel(
 				prdSource,
 				prdFile,
 				maxRetries,
-				retryDelay
+				retryDelay,
+				browserEnabled
 			)
 		);
 

@@ -124,8 +124,12 @@ is_browser_available() {
     return 1
   fi
   if [[ "$BROWSER_ENABLED" == "true" ]]; then
-    command -v agent-browser &>/dev/null
-    return $?
+    if ! command -v agent-browser &>/dev/null; then
+      log_warn "--browser flag used but agent-browser CLI not found"
+      log_warn "Install from: https://agent-browser.dev"
+      return 1
+    fi
+    return 0
   fi
   # auto mode: check if available
   command -v agent-browser &>/dev/null
