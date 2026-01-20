@@ -696,6 +696,8 @@ ${BOLD}AI ENGINE OPTIONS:${RESET}
   --qwen              Use Qwen-Code
   --droid             Use Factory Droid
   --model <name>      Override default model for any engine
+                      Claude: sonnet, haiku, opus
+                      OpenCode: gpt-4o, gpt-4o-mini, o1, o3-mini
   --sonnet            Shortcut for --claude --model sonnet
 
 ${BOLD}WORKFLOW OPTIONS:${RESET}
